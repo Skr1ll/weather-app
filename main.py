@@ -1,12 +1,10 @@
 import httpx
-from fastapi import FastAPI, Depends, Request, Response
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime
 import os
-import time
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, REGISTRY
 
 # Получаем URL базы данных из переменных окружения
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./weather.db")
@@ -25,6 +23,8 @@ class WeatherRequest(Base):
     temperature = Column(Float)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
+
+# Создаём таблицы
 Base.metadata.create_all(bind=engine)
 
 
@@ -36,118 +36,54 @@ def get_db():
         db.close()
 
 
+# ========== КООРДИНАТЫ ГОРОДОВ (с большой буквы) ==========
 
-http_requests_total = Counter(
-    'http_requests_total',
-    'Total HTTP requests',
-    ['method', 'endpoint', 'status_code']
-)
+CITY_COORDINATES = {
+    "Moscow": {"lat": 55.7558, "lon": 37.6173},
+    "London": {"lat": 51.5074, "lon": -0.1278},
+    "New York": {"lat": 40.7128, "lon": -74.0060},
+    "Tokyo": {"lat": 35.6895, "lon": 139.6917},
+    "Paris": {"lat": 48.8566, "lon": 2.3522},
+    "Berlin": {"lat": 52.5200, "lon": 13.4050},
+    "Rome": {"lat": 41.9028, "lon": 12.4964},
+    "Madrid": {"lat": 40.4168, "lon": -3.7038},
+    "Dubai": {"lat": 25.2048, "lon": 55.2708},
+    "Beijing": {"lat": 39.9042, "lon": 116.4074},
+    "Delhi": {"lat": 28.6139, "lon": 77.2090},
+    "Sydney": {"lat": -33.8688, "lon": 151.2093},
+    "Rio": {"lat": -22.9068, "lon": -43.1729},
+    "Cape Town": {"lat": -33.9249, "lon": 18.4241},
+    "Istanbul": {"lat": 41.0082, "lon": 28.9784},
+}
 
-# Счётчик ошибок
-errors_total = Counter(
-    'errors_total',
-    'Total errors by type',
-    ['error_type', 'endpoint']
-)
-
-
-http_request_duration = Histogram(
-    'http_request_duration_seconds',
-    'HTTP request duration in seconds',
-    ['method', 'endpoint'],
-    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
-)
-
-# Счётчик запросов к Open-Meteo API
-api_calls_total = Counter(
-    'api_calls_total',
-    'Total calls to Open-Meteo API',
-    ['city']
-)
-
-
-active_requests = Gauge(
-    'active_requests',
-    'Currently processing requests'
-)
-
-last_temperature = Gauge(
-    'last_temperature_celsius',
-    'Last measured temperature',
-    ['city']
-)
-
-db_size_bytes = Gauge(
-    'db_size_bytes',
-    'Database file size in bytes'
-)
-
-
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    active_requests.inc()  # Увеличиваем счётчик активных запросов
-    start_time = time.time()
-
-    try:
-        response = await call_next(request)
-
-        # Записываем метрики
-        duration = time.time() - start_time
-        http_request_duration.labels(
-            method=request.method,
-            endpoint=request.url.path
-        ).observe(duration)
-
-        http_requests_total.labels(
-            method=request.method,
-            endpoint=request.url.path,
-            status_code=response.status_code
-        ).inc()
-
-        return response
-
-    except Exception as e:
-        # Считаем ошибки
-        errors_total.labels(
-            error_type=type(e).__name__,
-            endpoint=request.url.path
-        ).inc()
-        raise
-    finally:
-        active_requests.dec()  # Уменьшаем счётчик
-
-
-# Эндпоинт для Prometheus (чтобы собирать метрики)
-@app.get("/metrics")
-async def get_metrics():
-    # Обновляем размер базы данных
-    if os.path.exists("./weather.db"):
-        db_size_bytes.set(os.path.getsize("./weather.db"))
-
-    return Response(generate_latest(REGISTRY), media_type="text/plain")
-
-
-app = FastAPI(
-    title="Weather Service",
-    description="Сервис погоды с метриками Prometheus",
-    version="1.0.0"
-)
+app = FastAPI(title="Weather Service")
 
 
 @app.get("/")
 def home():
-    return {"message": "Weather Service with Docker, PostgreSQL, Prometheus, Grafana"}
+    return {
+        "message": "Weather Service with Docker, PostgreSQL",
+        "available_cities": list(CITY_COORDINATES.keys())
+    }
 
 
 @app.get("/weather/{city_name}")
 async def get_weather(city_name: str, db: Session = Depends(get_db)):
-    # Считаем вызов API
-    api_calls_total.labels(city=city_name).inc()
+    # Проверяем, есть ли город в словаре (точное совпадение с большой буквы)
+    if city_name not in CITY_COORDINATES:
+        available = ", ".join(CITY_COORDINATES.keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Город '{city_name}' не найден. Доступные города: {available}"
+        )
+
+    # Получаем координаты города
+    coords = CITY_COORDINATES[city_name]
 
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": 55.75,
-        "longitude": 37.62,
+        "latitude": coords["lat"],
+        "longitude": coords["lon"],
         "current_weather": True
     }
 
@@ -156,9 +92,6 @@ async def get_weather(city_name: str, db: Session = Depends(get_db)):
         data = response.json()
 
     current_temp = data["current_weather"]["temperature"]
-
-    # Сохраняем последнюю температуру в метрику
-    last_temperature.labels(city=city_name).set(current_temp)
 
     new_request = WeatherRequest(
         city=city_name,
@@ -170,13 +103,13 @@ async def get_weather(city_name: str, db: Session = Depends(get_db)):
     return {
         "city": city_name,
         "temperature_celsius": current_temp,
-        "message": "Saved to PostgreSQL!"
+        "message": f"Сохранено в базу данных для города {city_name}!"
     }
 
 
 @app.get("/history")
 def get_history(db: Session = Depends(get_db)):
-    history = db.query(WeatherRequest).order_by(WeatherRequest.timestamp.desc()).limit(20).all()
+    history = db.query(WeatherRequest).order_by(WeatherRequest.timestamp.desc()).limit(50).all()
     return [
         {
             "city": h.city,
@@ -185,3 +118,29 @@ def get_history(db: Session = Depends(get_db)):
         }
         for h in history
     ]
+
+
+@app.get("/history/{city_name}")
+def get_history_by_city(city_name: str, db: Session = Depends(get_db)):
+    """История запросов для конкретного города"""
+    history = db.query(WeatherRequest).filter(
+        WeatherRequest.city == city_name
+    ).order_by(WeatherRequest.timestamp.desc()).limit(30).all()
+
+    return [
+        {
+            "city": h.city,
+            "temperature": h.temperature,
+            "timestamp": h.timestamp.isoformat()
+        }
+        for h in history
+    ]
+
+
+@app.get("/cities")
+def get_available_cities():
+    """Список всех доступных городов"""
+    return {
+        "cities": list(CITY_COORDINATES.keys()),
+        "count": len(CITY_COORDINATES)
+    }
